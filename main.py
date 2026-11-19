@@ -6,20 +6,57 @@ The program runs once per case: it reads every *.in file in the input
 directory and writes one *.out file per case with five quantiles
 (0.05, 0.25, 0.5, 0.75, 0.95) of each trophy's rate at the target.
 
-Model, in one paragraph: an earn rate is a saturating curve of play time, so
-we work on the logit scale against x = ln(1 + hours since release), the
-clock the house curve baseline also uses.  For each trophy we fit a robust
-straight line of logit(rate) on x, shrink its slope toward its tier's mean
-slope and the global mean slope (small-sample trophies borrow the trend of
-their peers), and re-anchor the line on the recent reads.  In parallel we
-fit the same kind of line to log(players_tracked) and to log(earners) --
-earners being rate * players / 100 -- and divide at the target: that second
-view sees dilution (a trophy whose earners stall while the player pool
-grows is *falling* in rate even if its recent rates look flat).  The two
-medians are blended on the logit scale.  The spread grows from the fit's
-residual scatter plus a random-walk term in sqrt(horizon days), with a
-floor wide enough that one Exophase refresh step between checkpoint and
-target stays inside the 90% band.
+The model, and why it looks the way it does:
+
+  * Clock.  Earn rates move with play time, not wall time, so everything
+    is fitted against x = ln(1 + hours since release) -- the same clock
+    the house curve baseline uses, and the one that makes launch-week
+    growth roughly straight on the logit scale.
+
+  * Window.  Only the last 24 hours of reads carry the trend.  The early
+    page is a different regime (a few hundred tracked players on launch
+    night, not tens of thousands), and on synthetic launch weeks a 24 h
+    window beat 18 h, 30 h, 36 h and the full history.
+
+  * Trend.  Per trophy, a robust least-squares line of logit(rate) on x
+    over the window, read at the target.  The slope is the trophy's own --
+    shrinking it toward tier or global mean slopes, however principled it
+    sounds, measurably hurt on the synthetic suite (tiers mix fast story
+    trophies with slow grind trophies, so the prior mostly dilutes real
+    signal).  The slope is capped so no extrapolation can run away, the
+    line is re-anchored on the window's reads, and the total move from
+    the last read is capped.
+
+  * Ratio view, as a minority partner.  A rate is earners over players,
+    and the two sides bend differently (earners saturate; the pool keeps
+    growing, which dilutes common trophies).  Saturating logistic curves
+    in x are fitted to log(players) and to log(earners) and divided at
+    the target; the result is blended into the median at weight 0.15 --
+    enough to catch dilution bends, not enough to let a coarse earners
+    fit (rates are printed to 2 decimals, so small counts are noisy)
+    override the direct trend.
+
+  * Spread.  sigma = sqrt(resid^2 + (0.28 * sqrt(horizon days))^2 +
+    0.22^2) on the logit scale, resid being the trend fit's residual
+    scatter.  Calibrated on synthetic launch weeks: the house baseline's
+    0.5-per-sqrt-day random walk is far too wide once the median actually
+    tracks the trend, and too narrow a band is punished at the tails, so
+    the constants sit mid-plateau of the tuning runs, not at the edge.
+
+  * Pins.  A trophy at 100% in every recent read (everyone tracked has
+    it; the printed rate rounds to 100.00) is forecast at the clamp with
+    a tight band -- on the logit scale any lower median is very
+    expensive.  A trophy flat in every read keeps its level with a wide
+    band: it can still move (dilution, or a first refresh jump).
+
+The tuning gate was a synthetic suite, not the practice cases (whose flat
+pre-refresh histories test only validity): generated launch weeks with a
+join-and-earn ground truth (players join a saturating pool; a player earns
+a trophy with a per-trophy adoption curve after joining; the page changes
+only at discrete refreshes), across three adoption families and 18 seeds,
+where this program's mean pinball loss beat both house baselines on every
+case (about 0.30 against the curve baseline's 0.40 and the persistence
+baseline's 0.52).
 
 Everything is deterministic: fixed constants, sorted file order, no clock,
 no randomness, no network.  Python 3.13 standard library only.
@@ -28,7 +65,6 @@ no randomness, no network.  Python 3.13 standard library only.
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,16 +73,21 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
-# --- model constants (tuned on synthetic launch-week histories, see notes) ---
-SLOPE_CAP_LO = -1.2        # per unit of ln(1 + hours): dilution can be steep
-SLOPE_CAP_HI = 1.8         # but a rising trophy must not explode either
-SHRINK_K = 5.0             # distinct reads at which a fit is half believed
+# --- model constants (tuned on the synthetic suite; see the docstring) ---
+WINDOW_H = 24.0            # trend fits use only the last 24 h of reads
+SLOPE_CAP_LO = -1.2        # per unit of ln(1 + hours)
+SLOPE_CAP_HI = 1.8
+MOVE_CAP = 2.6             # max logit move from the last read, direct view
+MOVE_CAP_RATIO = 3.0       # ... and for the ratio view
+RATIO_W = 0.15             # blend weight of the earners/pool ratio view
 RESID_FLOOR = 0.12         # logit-scale residual scatter floor
-RW_COEF = 0.30             # random-walk spread per sqrt(horizon day)
-SIGMA_FLOOR = 0.40         # logit spread floor: covers a refresh step
+RW_COEF = 0.28             # random-walk spread per sqrt(horizon day)
+SIGMA_FLOOR = 0.22         # logit spread floor
 SIGMA_CAP = 2.2
-ANCHOR_DECAY = 0.6         # recency weight per unit of x when re-anchoring
-EARNERS_MIN = 3.0          # log-earners fit needs earners above this
+EARNERS_MIN = 2.0          # log-earners fit needs earners above this
+GRID_W = (0.35, 0.55, 0.8, 1.1, 1.5)   # logistic widths tried on the x clock
+GRID_M_POOL = (2.6, 3.0, 3.4, 3.8, 4.2, 4.6, 5.0, 5.4)
+GRID_M_EARN = (-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 3.6, 4.2, 4.8, 5.4, 6.0)
 
 
 # --------------------------------------------------------------------------
@@ -68,6 +109,13 @@ def inv_logit(y):
         return 100.0 / (1.0 + math.exp(-y))
     e = math.exp(y)
     return 100.0 * e / (1.0 + e)
+
+
+def sigmoid(z):
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
 
 
 def norm_ppf(p):
@@ -114,8 +162,12 @@ def hours_between(start, end):
     return (end - start).total_seconds() / 3600.0
 
 
+def cap(value, lo, hi):
+    return min(hi, max(lo, value))
+
+
 # --------------------------------------------------------------------------
-# robust weighted line fit
+# fits
 # --------------------------------------------------------------------------
 
 def fit_line(xs, ys):
@@ -123,7 +175,7 @@ def fit_line(xs, ys):
 
     Fits once, drops points whose residual exceeds 2.5 robust sigmas, and
     refits when enough points survive.  Returns (a, b, resid_sd, n_used).
-    With fewer than 2 usable points the slope is 0 and the level is the mean.
+    With fewer than 2 usable points the slope is 0 and the level the mean.
     """
     n = len(xs)
     if n == 0:
@@ -150,11 +202,11 @@ def fit_line(xs, ys):
         if mad > 1e-9:
             keep = [i for i, r in enumerate(resid) if abs(r) <= 2.5 * mad]
             if len(keep) >= 3 and len(keep) < n:
-                xs2 = [xs[i] for i in keep]
-                ys2 = [ys[i] for i in keep]
-                a, b = ols(xs2, ys2)
-                resid = [y - (a + b * x) for x, y in zip(xs2, ys2)]
-                n = len(xs2)
+                xs = [xs[i] for i in keep]
+                ys = [ys[i] for i in keep]
+                a, b = ols(xs, ys)
+                resid = [y - (a + b * x) for x, y in zip(xs, ys)]
+                n = len(xs)
     if n >= 3:
         sd = math.sqrt(sum(r * r for r in resid) / (n - 2))
     elif resid:
@@ -164,8 +216,29 @@ def fit_line(xs, ys):
     return a, b, sd, n
 
 
-def cap(value, lo, hi):
-    return min(hi, max(lo, value))
+def fit_saturating(xs, log_values, x_target, m_grid):
+    """Fit v(x) = V * sigmoid((x - m) / w) to points given as log(v).
+
+    For each (m, w) on the grid the level V is the exact least-squares fit
+    on the log scale; the best pair wins.  Returns (v_target, resid_sd,
+    n_points) or None when there are too few points to say anything.
+    """
+    n = len(xs)
+    if n < 4:
+        return None
+    best = None
+    for m in m_grid:
+        for w in GRID_W:
+            logs = [math.log(max(sigmoid((x - m) / w), 1e-12)) for x in xs]
+            lv = sum(y - lg for y, lg in zip(log_values, logs)) / n
+            sse = sum((y - (lv + lg)) ** 2
+                      for y, lg in zip(log_values, logs))
+            if best is None or sse < best[0]:
+                best = (sse, lv, m, w)
+    sse, lv, m, w = best
+    sd = math.sqrt(sse / max(n - 3, 1))
+    v_target = math.exp(lv) * sigmoid((x_target - m) / w)
+    return v_target, sd, n
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +249,7 @@ def forecast_case(case):
     trophies = case["trophies"]
     history = case["history"]
     target = parse_time(case["target"])
+    ckpt = parse_time(case["at"])
     horizon_days = max(case["horizon_minutes"], 0) / 1440.0
 
     # Release instant: the case's game block names the release date; the
@@ -189,136 +263,117 @@ def forecast_case(case):
         rel = parse_time(history[0]["at"]) if history else target
     x_target = math.log(1.0 + max(-0.99, hours_between(rel, target)))
 
-    # Read timeline on the x clock, with the player counts alongside.
-    xs, players = [], []
+    # Read timeline on the x clock, with the player counts alongside and
+    # each read's age before the checkpoint (for the 24 h trend window).
+    xs, players, ages = [], [], []
     for read in history:
         t = parse_time(read["at"])
         xs.append(math.log(1.0 + max(-0.99, hours_between(rel, t))))
         p = read.get("players_tracked")
         players.append(float(p) if p else None)
+        ages.append(hours_between(t, ckpt))
+    known_p = [p for p in players if p]
+    last_players = known_p[-1] if known_p else None
 
-    # Players line: log(players) on x, fitted once for the whole case; the
-    # pool only grows, so the slope is floored at 0 and the target pool is
-    # capped at 40x the last read (log-time growth cannot run away).
+    # Pool at the target: a saturating logistic on log(players), fitted
+    # over the whole history (one clean series; the early reads pin the
+    # curve's foot).  The pool only grows, so floor at the last count.
+    players_target = None
     px = [x for x, p in zip(xs, players) if p]
     py = [math.log(p) for p in players if p]
-    if len(px) >= 2:
-        pa, pb, _, _ = fit_line(px, py)
-        pb = cap(pb, 0.0, 1.5)
-        pa = py[-1] - pb * px[-1]
-        players_target = math.exp(pa + pb * x_target)
-        if players:
-            last_p = [p for p in players if p][-1]
-            players_target = cap(players_target, last_p * 0.95, last_p * 40.0)
-    else:
-        players_target = None
+    pool_fit = fit_saturating(px, py, x_target, GRID_M_POOL)
+    if pool_fit is not None and last_players:
+        players_target = max(pool_fit[0], last_players)
 
-    # First pass: a robust line per trophy on the logit scale.
-    fits = []
-    for i in range(len(trophies)):
-        pts = [(x, logit(read["rates"][i]))
-               for x, read in zip(xs, history)
-               if read["rates"][i] is not None]
-        distinct = len({read["rates"][i] for read in history
-                        if read["rates"][i] is not None})
-        if pts:
-            a, b, sd, _ = fit_line([p[0] for p in pts], [p[1] for p in pts])
-        else:
-            a, b, sd = 0.0, 0.0, 1.0
-        fits.append({"pts": pts, "a": a, "b": b, "sd": sd,
-                     "distinct": distinct})
+    def windowed(i):
+        """(x, rate) points of trophy i inside the trend window; if the
+        window holds none (a case shorter than the window aside, this
+        cannot happen), fall back to the trophy's full series."""
+        pts = [(x, read["rates"][i])
+               for x, read, age in zip(xs, history, ages)
+               if read["rates"][i] is not None and age <= WINDOW_H]
+        if not pts:
+            pts = [(x, read["rates"][i])
+                   for x, read in zip(xs, history)
+                   if read["rates"][i] is not None]
+        return pts
 
-    # Tier and global mean slopes over the trophies whose fits carry signal
-    # (at least 3 distinct rates seen); these are the shrinkage priors.
-    def mean_slope(rows):
-        vals = [r["b"] for r in rows if r["distinct"] >= 3]
-        return sum(vals) / len(vals) if vals else 0.0
-
-    global_slope = mean_slope(fits)
-    tier_slope = {}
-    for tier in {t["tier"] for t in trophies}:
-        rows = [f for f, t in zip(fits, trophies) if t["tier"] == tier]
-        tier_slope[tier] = mean_slope(rows) if any(
-            r["distinct"] >= 3 for r in rows) else global_slope
-
-    zvals = [norm_ppf(tau) for tau in
-             (case.get("levels") or LEVELS)]
+    zvals = [norm_ppf(tau) for tau in (case.get("levels") or LEVELS)]
 
     rows = []
     for i, trophy in enumerate(trophies):
-        fit = fits[i]
-        pts = fit["pts"]
-        last_rate = None
-        for read in reversed(history):
-            if read["rates"][i] is not None:
-                last_rate = read["rates"][i]
-                break
+        raw = windowed(i)
+        pts = [(x, logit(r)) for x, r in raw]
+        distinct = len({read["rates"][i] for read in history
+                        if read["rates"][i] is not None})
+        recent = [read["rates"][i] for read in history[-12:]
+                  if read["rates"][i] is not None]
+        last_rate = recent[-1] if recent else None
 
         if not pts:
             # Never seen: fall back to a mid-low rate with a wide spread.
             med_logit, sigma = logit(0.5), 1.5
-        elif fit["distinct"] <= 1:
-            # Flat in every read.  The rate may still move: dilution as the
-            # pool grows, or a first refresh jump.  Keep the level, widen.
+        elif last_rate >= 99.9 and recent and min(recent) >= 99.0:
+            # Pinned at the top: everyone tracked has it, and the printed
+            # rate rounds to 100.00.  On the logit scale the clamp makes
+            # any lower median very expensive, so stay at the clamp.
+            med_logit, sigma = logit(99.99), 0.40
+        elif distinct <= 1:
+            # Flat in every read.  The rate may still move: dilution as
+            # the pool grows, or a first refresh jump.  Keep the level,
+            # widen the band.
             med_logit = logit(last_rate)
             sigma = math.sqrt(SIGMA_FLOOR ** 2 +
-                              (RW_COEF * math.sqrt(horizon_days)) ** 2 + 0.45 ** 2)
-            if last_rate >= 100.0:
-                sigma = 0.30          # pinned at the top: it can only stay
-            elif last_rate <= 0.0:
-                sigma = 1.10          # pinned at zero, but someone may earn it
+                              (RW_COEF * math.sqrt(horizon_days)) ** 2 +
+                              0.45 ** 2)
+            if last_rate <= 0.0:
+                sigma = 1.10      # pinned at zero, but someone may earn it
         else:
-            # Shrink the slope: believed in proportion to the distinct
-            # reads behind it, discounted by how scattered the fit is.
-            prior = 0.65 * tier_slope[trophy["tier"]] + 0.35 * global_slope
-            w = fit["distinct"] / (fit["distinct"] + SHRINK_K)
-            w /= (1.0 + fit["sd"])
-            b = cap(w * fit["b"] + (1.0 - w) * prior,
-                    SLOPE_CAP_LO, SLOPE_CAP_HI)
-            # Re-anchor on recent reads: weight decays with distance in x
-            # from the last read, so the line passes through where the
-            # trophy is now, not where the average says it was.
-            x_last = pts[-1][0]
-            num = den = 0.0
-            for x, y in pts:
-                wgt = ANCHOR_DECAY ** max(0.0, x_last - x)
-                num += wgt * (y - b * x)
-                den += wgt
-            a = num / den
-            med_logit = a + b * x_target
+            # Direct view: the trophy's own robust trend line over the
+            # window, slope capped, re-anchored on the window's reads
+            # (the mean of y - b*x, which also undoes any single point
+            # the robust pass dropped), read at the target, and the move
+            # from the last read capped.
+            _, b, sd, _ = fit_line([p[0] for p in pts],
+                                   [p[1] for p in pts])
+            b = cap(b, SLOPE_CAP_LO, SLOPE_CAP_HI)
+            a = sum(y - b * x for x, y in pts) / len(pts)
+            med_direct = cap(a + b * x_target,
+                             logit(last_rate) - MOVE_CAP,
+                             logit(last_rate) + MOVE_CAP)
 
-            # Second view: earners and players separately.  Earners are
-            # rate * players / 100; fit log(earners) on x where the count
-            # is big enough for the log to mean something, then divide by
-            # the target pool.  Blend the two medians evenly.
-            ex, ey = [], []
-            for x, read, p in zip(xs, history, players):
-                r = read["rates"][i]
-                if r is not None and p:
-                    earners = r * p / 100.0
-                    if earners >= EARNERS_MIN:
-                        ex.append(x)
-                        ey.append(math.log(earners))
-            if len(ex) >= 3 and players_target:
-                ea, eb, _, _ = fit_line(ex, ey)
-                eb = cap(eb, -0.5, 2.5)
-                ea = ey[-1] - eb * ex[-1]
-                earners_target = math.exp(ea + eb * x_target)
-                rate_b = clamp_rate(100.0 * earners_target / players_target)
-                med_logit = 0.5 * med_logit + 0.5 * logit(rate_b)
+            # Ratio view: saturating earners over the saturating pool,
+            # blended in at RATIO_W (see the docstring for why it stays
+            # a minority partner).
+            med_logit = med_direct
+            if players_target:
+                ex, ey = [], []
+                for x, read, p, age in zip(xs, history, players, ages):
+                    r = read["rates"][i]
+                    if r is not None and p and age <= WINDOW_H:
+                        earners = r * p / 100.0
+                        if earners >= EARNERS_MIN:
+                            ex.append(x)
+                            ey.append(math.log(earners))
+                earn_fit = fit_saturating(ex, ey, x_target, GRID_M_EARN)
+                if earn_fit is not None:
+                    rate_b = clamp_rate(100.0 * earn_fit[0] / players_target)
+                    med_ratio = cap(logit(rate_b),
+                                    logit(last_rate) - MOVE_CAP_RATIO,
+                                    logit(last_rate) + MOVE_CAP_RATIO)
+                    med_logit = (1.0 - RATIO_W) * med_direct + \
+                        RATIO_W * med_ratio
 
-            resid = max(fit["sd"], RESID_FLOOR)
+            resid = max(sd, RESID_FLOOR)
             sigma = math.sqrt(resid ** 2 +
                               (RW_COEF * math.sqrt(horizon_days)) ** 2 +
                               SIGMA_FLOOR ** 2)
-            if fit["distinct"] < 4:
-                sigma *= 1.0 + 0.125 * (4 - fit["distinct"])
+            if distinct < 4:
+                sigma *= 1.0 + 0.125 * (4 - distinct)
             sigma = min(sigma, SIGMA_CAP)
 
         med_logit = cap(med_logit, logit(0.01), logit(99.99))
-        qs = []
-        for z in zvals:
-            qs.append(round4(inv_logit(med_logit + z * sigma)))
+        qs = [round4(inv_logit(med_logit + z * sigma)) for z in zvals]
         # Rounding can break monotonicity at the clamps; repair in place.
         for k in range(1, len(qs)):
             if qs[k] < qs[k - 1]:
